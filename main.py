@@ -8,21 +8,28 @@ pyautogui.PAUSE = 0.0 # Make pyautogui faster
 screen_w, screen_h = pyautogui.size()
 
 # Tracking Zone configuration (adjust these values)
-FRAME_REDUCTION_X = 160 # Pixels to crop from left/right of camera frame
-FRAME_REDUCTION_Y = 90 # Pixels to crop from top/bottom of camera frame
-
-# Click detection threshold (normalized distance between thumb and index)
-CLICK_THRESHOLD = 0.05 
-CLICK_COOLDOWN = 10 # Number of frames to wait after a click
+# Use percentages (0.2 means 20% of the camera frame is a dead-border)
+MARGIN_X = 0.2 
+MARGIN_Y = 0.2
 
 # Smoothing factor (lower = more smoothing, less responsive)
-SMOOTHING_FACTOR = 0.3
+SMOOTHING_FACTOR = 0.2
+
+# Initializing prev_smoothing values
+prev_smooth_x, prev_smooth_y = 0.5, 0.5
+
+# Click detection threshold (normalized distance between thumb and index)
+CLICK_THRESHOLD = 0.05
+CLICK_COOLDOWN = 10 # Number of frames to wait after a click
 
 # --- Initialization ---
 mp_hands = mp.solutions.hands
 mp_draw = mp.solutions.drawing_utils
-hands = mp_hands.Hands(max_num_hands=1, min_detection_confidence=0.7)
+hands = mp_hands.Hands(max_num_hands = 1, min_detection_confidence = 0.7, min_tracking_confidence = 0.7)
 cap = cv2.VideoCapture(0)
+cap.set(cv2.CAP_PROP_FRAME_WIDTH, 800)
+cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 600)
+
 
 # Variables for state
 prev_mouse_x, prev_mouse_y = 0, 0
@@ -36,6 +43,7 @@ while cap.isOpened():
 
     frame = cv2.flip(frame, 1)
     h, w, _ = frame.shape
+    #print("frame size = ", h, w)
     rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     result = hands.process(rgb)
 
@@ -49,69 +57,73 @@ while cap.isOpened():
     if result.multi_hand_landmarks:
         hand_landmarks = result.multi_hand_landmarks[0]
         
-        # 1. Get landmark coordinates (index tip=8, thumb tip=4)
-        lm_index = hand_landmarks.landmark[8]
-        lm_thumb = hand_landmarks.landmark[4]
+        # Get landmark coordinates (index tip=8, thumb tip=4)
+        f_index_tip = hand_landmarks.landmark[8]
+        f_index_pip = hand_landmarks.landmark[6]
+        f_index_mcp = hand_landmarks.landmark[5]
+        f_thumb_tip = hand_landmarks.landmark[4]
         
-        # Convert index fingertip to pixel coordinates
-        x, y = int(lm_index.x * w), int(lm_index.y * h)
+        # STEP 1: Get Raw High-Precision Coordinates (0.0 - 1.0)
+        raw_x, raw_y = f_index_tip.x, f_index_tip.y
         
-        # 2. Map coordinates (with Restricted Zone)
+        # STEP 2: Exponential Moving Average (EMA) Smoothing
+        # We smooth the raw sensor data BEFORE scaling it to the screen pixels.
+        # This kills the "jitter" at the source.
+        smooth_x = prev_smooth_x + (raw_x - prev_smooth_x) * SMOOTHING_FACTOR
+        smooth_y = prev_smooth_y + (raw_y - prev_smooth_y) * SMOOTHING_FACTOR
         
-        # Define the active region for tracking
-        active_w = w - 2 * FRAME_REDUCTION_X
-        active_h = h - 2 * FRAME_REDUCTION_Y
+        # Save current smooth values for the next frame's calculation
+        prev_smooth_x, prev_smooth_y = smooth_x, smooth_y
 
-        # Calculate coordinates relative to the active region
-        rel_x = x - FRAME_REDUCTION_X
-        rel_y = y - FRAME_REDUCTION_Y
-
-        # Clamp relative coordinates to be within [0, active_size]
-        clamped_x = np.clip(rel_x, 0, active_w)
-        clamped_y = np.clip(rel_y, 0, active_h)
-
-        # Map clamped coordinates to screen resolution
-        target_x = screen_w / active_w * clamped_x
-        target_y = screen_h / active_h * clamped_y
-
-        # 3. Smoothing (Exponential Moving Average)
-        if prev_mouse_x == 0 and prev_mouse_y == 0:
-            # Initialize on first detection
-            prev_mouse_x, prev_mouse_y = target_x, target_y
-        else:
-            # Apply smoothing
-            target_x = int(prev_mouse_x + (target_x - prev_mouse_x) * SMOOTHING_FACTOR)
-            target_y = int(prev_mouse_y + (target_y - prev_mouse_y) * SMOOTHING_FACTOR)
-            prev_mouse_x, prev_mouse_y = target_x, target_y
+        # STEP 3: Map to Screen using Linear Interpolation (np.interp)
+        # This maps the 'active area' (e.g., 0.2 to 0.8) to the full screen (0 to screen_w)
+        # It also handles 'clamping' automatically so the mouse doesn't go off-screen.
+        target_x = np.interp(smooth_x, [MARGIN_X, 1 - MARGIN_X], [0, screen_w])
+        target_y = np.interp(smooth_y, [MARGIN_Y, 1 - MARGIN_Y], [0, screen_h])
 
         # 4. Move Mouse
         pyautogui.moveTo(target_x, target_y)
         
-        # 5. Click Detection
-        # Calculate Euclidean distance between thumb and index tips (normalized to 0-1)
-        dist = np.sqrt((lm_index.x - lm_thumb.x)**2 + (lm_index.y - lm_thumb.y)**2)
         
-        if dist < CLICK_THRESHOLD and not is_clicking and click_cooldown_counter == 0:
-            # Trigger Click
+        # Calculate Euclidean distance between thumb and index tips (normalized to 0-1)
+        # dist = np.sqrt((f_index_tip.x - f_thumb_tip.x)**2 + (f_index_tip.y - f_thumb_tip.y)**2)
+        # 5. Click Detection
+        # 2. Calculate distances (Normalized)
+        # Distance to the knuckle
+        dist_mcp = np.sqrt((f_thumb_tip.x - f_index_mcp.x)**2 + (f_thumb_tip.y - f_index_mcp.y)**2)
+        # Distance to the middle joint
+        dist_pip = np.sqrt((f_thumb_tip.x - f_index_pip.x)**2 + (f_thumb_tip.y - f_index_pip.y)**2)
+
+        # 3. Logic: If thumb is close to either joint, it's a click
+        # We use 'min' to see which one is closer
+        current_dist = min(dist_mcp, dist_pip)
+        print(current_dist, CLICK_THRESHOLD)
+
+        if current_dist < CLICK_THRESHOLD and not is_clicking and click_cooldown_counter == 0:
             pyautogui.click()
             is_clicking = True
-            click_cooldown_counter = CLICK_COOLDOWN # Start cooldown
-            cv2.circle(frame, (x, y), 15, (0, 0, 255), -1) # Red circle for click
-        elif dist >= CLICK_THRESHOLD and is_clicking:
-            # Reset click state when gesture is released
-            is_clicking = False
+            click_cooldown_counter = CLICK_COOLDOWN
+            # Visual feedback: Change color of the circle or draw a line
+            # cv2.line(frame, (int(f_thumb_tip.x * w), int(f_thumb_tip.y * h)), 
+            #         (int(f_index_pip.x * w), int(f_index_pip.y * h)), (255, 0, 0), 5)
+            cv2.circle(frame, (int(f_thumb_tip.x), int(f_thumb_tip.y)), 15, (0, 0, 255), -1)
             
-        # Draw Visuals
-        mp_draw.draw_landmarks(frame, hand_landmarks, mp_hands.HAND_CONNECTIONS)
-        cv2.circle(frame, (x, y), 10, (0, 255, 0) if not is_clicking else (0, 0, 255), -1)
+        elif current_dist > (CLICK_THRESHOLD + 0.02): # Added a small "buffer" to prevent flickering
+            is_clicking = False
         
-    # Draw the defined tracking zone
-    cv2.rectangle(
-        frame,
-        (FRAME_REDUCTION_X, FRAME_REDUCTION_Y),
-        (w - FRAME_REDUCTION_X, h - FRAME_REDUCTION_Y),
-        (255, 0, 0), 2
-    )
+        # if dist < CLICK_THRESHOLD and not is_clicking and click_cooldown_counter == 0:
+        #     # Trigger Click
+        #     pyautogui.click()
+        #     is_clicking = True
+        #     click_cooldown_counter = CLICK_COOLDOWN # Start cooldown
+        #     cv2.circle(frame, (x, y), 15, (0, 0, 255), -1) # Red circle for click
+        # elif dist >= CLICK_THRESHOLD and is_clicking:
+        #     # Reset click state when gesture is released
+        #     is_clicking = False
+            
+        # # Draw Visuals
+        mp_draw.draw_landmarks(frame, hand_landmarks, mp_hands.HAND_CONNECTIONS)
+        #cv2.circle(frame, (x, y), 10, (0, 255, 0) if not is_clicking else (0, 0, 255), -1)
 
     cv2.imshow("CaMouse - Hand Tracking", frame)
 
